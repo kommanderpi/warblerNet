@@ -255,6 +255,18 @@
     const getDefaultReviewer = () => { try { return localStorage.getItem(REVIEWER_KEY) || ""; } catch { return ""; } };
     const setDefaultReviewer = (name) => { try { localStorage.setItem(REVIEWER_KEY, name || ""); } catch {} };
 
+        // Load a default predictions.csv automatically
+    fetch("predictions.csv")
+      .then(res => res.text())
+      .then(text => {
+        const results = Papa.parse(text, { header: true }).data;
+        rows = results;
+        renderAll();
+        console.log("Loaded default predictions.csv with", results.length, "rows");
+      })
+      .catch(err => console.error("No default predictions.csv found", err));
+
+    
     // Priority (same as before; optional)
     function priorityFor(pred, conf, thr, lowNear, midLow, highConf) {
       if (pred === "species_of_interest") {
