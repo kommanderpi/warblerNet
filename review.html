@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Warbler Review • Scatter Graph + Audio Review</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Tailwind (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Papa Parse (CSV) -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <!-- d3 (for scatter plot) -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <style>
+    /* nicer scroll */
+    * { scrollbar-width: thin; }
+    .dot { cursor: pointer; }
+    .dot.selected { stroke-width: 2.5px; }
+    .tooltip {
+      position: absolute; pointer-events: none;
+      background: rgba(17, 24, 39, 0.95); color: #fff; font-size: 12px;
+      padding: 6px 8px; border-radius: 8px; white-space: nowrap;
+      transform: translate(-50%, -100%); z-index: 10;
+    }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+  <div class="max-w-7xl mx-auto px-4 py-6">
+    <header class="mb-4">
+      <h1 class="text-2xl font-bold">WarblerNet — Interactive Review</h1>
+      <p class="text-sm text-gray-600">Load <code>predictions.csv</code>. Then click dots to review audio, confirm/reject Warbler indentification, and export an updated CSV.</p>
+    </header>
+<header class="mb-4 relative text-center">
+  <img src="warbler.png" alt="Warbler Logo" class="mx-auto mb-3 h-24 object-contain">
+</header>
+    <!-- Controls -->
+    <section class="bg-white rounded-2xl shadow p-4 mb-4">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="">
+          <label class="block text-sm font-medium">Predictions CSV</label>
+          <div id="dropzone"
+               class="border-2 border-dashed rounded-xl p-4 text-center text-gray-500 hover:bg-gray-50 cursor-pointer">
+            Drop <b>predictions.csv</b> here or click to choose
+            <input id="csvInput" type="file" accept=".csv" class="hidden" />
+          </div>
+          <p class="text-xs text-gray-500 mt-1">Columns expected: <code>file,predicted_event,confidence</code></p>
+        </div>
+        <div class="">
+          <label class="block text-sm font-medium">Audio Base URL/Path (optional)</label>
+          <input id="audioBase" type="text" placeholder="your-server/audiofolder"
+                 class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-5 gap-3 mt-4">
+        <div>
+          <label class="block text-sm font-medium">Decision Threshold</label>
+          <input id="thr" type="number" step="0.01" min="0" max="1" value="0.10"
+                 class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+        </div>
+        <div>
+          <label class="block text-sm font-medium">Low-Near Threshold</label>
+          <input id="lowNear" type="number" step="0.01" min="0" max="1" value="0.10"
+                 class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+        </div>
+        <div>
+          <label class="block text-sm font-medium">Mid-Low Edge</label>
+          <input id="midLow" type="number" step="0.01" min="0" max="1" value="0.30"
+                 class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+        </div>
+        <div>
+          <label class="block text-sm font-medium">High Confidence Edge</label>
+          <input id="highConf" type="number" step="0.01" min="0" max="1" value="0.70"
+                 class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+        </div>
+        <div class="flex items-end">
+          <button id="recompute" class="px-4 py-2 w-full rounded-xl bg-gray-900 text-white hover:bg-black">Recompute bands & graph</button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mt-4">
+        <div>
+          <label class="block text-sm font-medium">Filter: Predicted Event</label>
+          <select id="filterEvent" class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+            <option value="all">All</option>
+            <option value="species_of_interest">species_of_interest</option>
+            <option value="not_species_of_interest">not_species_of_interest</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium">Filter: Reviewed</label>
+          <select id="filterReviewed" class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+            <option value="all">All</option>
+            <option value="unreviewed">Unreviewed</option>
+            <option value="confirmed">Confirmed KW</option>
+            <option value="denied">Denied KW</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium">Search filename</label>
+          <input id="search" type="text" placeholder="e.g. 092ecf6c.wav"
+                 class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800" />
+        </div>
+        <div class="flex items-end">
+          <div id="counts" class="text-sm text-gray-600">Rows: 0</div>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap gap-3 mt-4">
+        <button id="exportUpdated" class="px-4 py-2 rounded-xl bg-white border hover:bg-gray-50">Export Updated CSV</button>
+        <button id="exportReview" class="px-4 py-2 rounded-xl bg-white border hover:bg-gray-50">Export Review Queue CSV</button>
+        <button id="exportPos" class="px-4 py-2 rounded-xl bg-white border hover:bg-gray-50">Export Positives-only CSV</button>
+      </div>
+
+      <!-- NEW: Global reviewer visible before CSV -->
+      <div class="mt-4">
+        <label class="block text-sm font-medium">Reviewer</label>
+        <input id="globalReviewer" type="text"
+               placeholder="Dr. Warbler"
+               class="w-full md:w-1/3 rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
+        <p class="text-xs text-gray-500 mt-1">
+          Default reviewer for all clips - unless specified in the dialog below
+        </p>
+      </div>
+    </section>
+
+    <!-- Graph + Sidebar -->
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <!-- Scatter -->
+      <div class="lg:col-span-2 bg-white rounded-2xl shadow p-4 relative">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="font-semibold">Confidence Scatter</h2>
+          <div class="text-xs text-gray-500">CLICK A DOT to review or press the RIGHT ARROW to start at first clip</div>
+        </div>
+        <div id="chartWrap" class="w-full h-[520px] relative">
+          <div id="tooltip" class="tooltip hidden"></div>
+          <!-- SVG is injected here -->
+        </div>
+        <div class="mt-2 text-xs text-gray-500">
+          X: file rank (sorted by confidence desc) • Y: confidence (0–1) • Color: event / review status
+        </div>
+      </div>
+
+      <!-- Sidebar Review Panel -->
+      <aside class="bg-white rounded-2xl shadow p-4">
+        <h2 class="font-semibold mb-3">Review Panel</h2>
+        <div id="noSel" class="text-gray-500 text-sm">Select a dot (file) to review.</div>
+        <div id="panel" class="hidden">
+          <div class="mb-2">
+            <div class="text-xs text-gray-500">Filename</div>
+            <div id="pFile" class="font-mono text-sm break-all"></div>
+          </div>
+          <div class="grid grid-cols-2 gap-3 text-sm">
+            <div>
+              <div class="text-xs text-gray-500">Predicted</div>
+              <div id="pPred" class=""></div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-500">Confidence</div>
+              <div id="pConf" class="tabular-nums"></div>
+            </div>
+          </div>
+
+          <div class="mt-3">
+            <audio id="pAudio" controls class="w-full"></audio>
+            <div class="text-xs text-gray-500 mt-1">If audio doesn’t play, ensure your base URL/path points to the raw file.</div>
+          </div>
+
+          <div class="mt-3">
+            <label class="block text-xs text-gray-500">Reviewer (optional)</label>
+            <input id="pReviewer" type="text" class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800" placeholder="Your name">
+          </div>
+          <div class="mt-3">
+            <label class="block text-xs text-gray-500">Notes (optional)</label>
+            <textarea id="pNotes" rows="3" class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800" placeholder="Observations, background species, noise, etc."></textarea>
+          </div>
+
+          <div class="flex gap-2 mt-4">
+            <button id="btnConfirm" class="px-3 py-2 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700">Confirm KW</button>
+            <button id="btnReject" class="px-3 py-2 rounded-lg bg-rose-600 text-white hover:bg-rose-700">Reject</button>
+            <button id="btnReset" class="px-3 py-2 rounded-lg bg-gray-100 hover:bg-gray-200">Reset</button>
+          </div>
+
+          <div id="saveMsg" class="text-xs text-emerald-700 mt-2 hidden">Saved to session. Export CSV to persist.</div>
+        </div>
+      </aside>
+    </section>
+
+    <!-- Table -->
+    <section class="bg-white rounded-2xl shadow overflow-hidden mt-4">
+      <div class="overflow-x-auto">
+        <table id="tbl" class="min-w-full text-sm">
+          <thead class="bg-gray-100 border-b">
+            <tr>
+              <th class="px-4 py-3 text-left">File</th>
+              <th class="px-4 py-3 text-left">Predicted</th>
+              <th class="px-4 py-3 text-left">Confidence</th>
+              <th class="px-4 py-3 text-left">Review Decision</th>
+              <th class="px-4 py-3 text-left">Reviewer</th>
+              <th class="px-4 py-3 text-left">Reviewed At</th>
+              <th class="px-4 py-3 text-left">Notes</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    // ======== State ========
+    let rows = [];           // all items {file, predicted_event, confidence, ...review fields}
+    let filtered = [];       // after filters/search
+    let selected = null;     // current row (object ref)
+    let svg, xScale, yScale, colorScale, xAxis, yAxis;
+    const margin = {top: 10, right: 20, bottom: 40, left: 45};
+
+    // ======== Helpers ========
+    const $ = (id) => document.getElementById(id);
+    const fmt4 = (x) => (typeof x === "number" ? x.toFixed(4) : x);
+    const nowIso = () => new Date().toISOString();
+
+    // Threshold bands (same logic as Python)
+    function bandOf(conf, thr, lowNear, midLow, highConf) {
+      if (conf >= highConf) return ">0.70";
+      if (conf >= midLow)  return "0.30–0.70";
+      if (conf >= thr)     return `${thr.toFixed(2)}–0.30`;
+      if (conf >= lowNear) return `${lowNear.toFixed(2)}–${thr.toFixed(2)}`;
+      return `<${lowNear.toFixed(2)}`;
+    }
+
+    // --- Persistent reviewer name (localStorage) ---
+    const REVIEWER_KEY = "warbler.defaultReviewer";
+    function getDefaultReviewer() {
+      try { return localStorage.getItem(REVIEWER_KEY) || ""; } catch { return ""; }
+    }
+    function setDefaultReviewer(name) {
+      try { localStorage.setItem(REVIEWER_KEY, name || ""); } catch {}
+    }
+
+    // Build review priority/action (we keep decision separate)
+    function priorityFor(pred, conf, thr, lowNear, midLow, highConf) {
+      if (pred === "species_of_interest") {
+        if (conf >= highConf) return "P1 (High)";
+        if (conf >= midLow)   return "P2 (Med)";
+        return "P3 (Med-Low)";
+      } else {
+        if (conf >= midLow)   return "P2 (Med)";
+        if (conf >= thr)      return "P3 (Med-Low)";
+        if (conf >= lowNear)  return "P4 (Low)";
+        return "P5 (Lowest)";
+      }
+    }
+
+    function parseCSVFile(file) {
+      return new Promise((resolve, reject) => {
+        Papa.parse(file, {
+          header: true,
+          skipEmptyLines: true,
+          complete: (res) => resolve(res.data),
+          error: reject
+        });
+      });
+    }
+
+    function downloadBlob(data, filename, type) {
+      const blob = new Blob([data], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function toCSV(arr, columns) {
+      const header = columns.join(",");
+      theLines = arr.map(r => columns.map(c => {
+        const v = r[c];
+        const s = (v === undefined || v === null) ? "" : String(v);
+        return `"${s.replace(/"/g,'""')}"`;
+      }).join(","));
+      return [header, ...theLines].join("\n");
+    }
+
+    // ======== Ingest & annotate ========
+    function ingestData(data) {
+      const thr = Number($("thr").value);
+      const lowNear = Number($("lowNear").value);
+      const midLow = Number($("midLow").value);
+      const highConf = Number($("highConf").value);
+
+      // Normalize required fields; add review defaults
+      rows = data.map(r => ({
+        file: String(r.file ?? "").trim(),
+        predicted_event: String(r.predicted_event ?? "").trim(),
+        confidence: Number.isFinite(Number(r.confidence)) ? Number(r.confidence) : 0,
+        // Computed annotations
+        conf_band: "",
+        priority: "",
+        // Review fields
+        review_decision: (r.review_decision ?? "unreviewed"),
+        reviewer: (r.reviewer ?? ""),
+        reviewed_at: (r.reviewed_at ?? ""),
+        review_notes: (r.review_notes ?? ""),
+      })).filter(r => r.file && !Number.isNaN(r.confidence));
+
+      // compute bands/priorities
+      for (const r of rows) {
+        r.conf_band = bandOf(r.confidence, thr, lowNear, midLow, highConf);
+        r.priority  = priorityFor(r.predicted_event, r.confidence, thr, lowNear, midLow, highConf);
+      }
+
+      // default sorting = by confidence desc
+      rows.sort((a,b)=> b.confidence - a.confidence);
+      filtered = rows.slice();
+      renderAll();
+    }
+
+    // ======== Filters/Search ========
+    function applyFilters() {
+      const ev = $("filterEvent").value;
+      const rev = $("filterReviewed").value;
+      const q = $("search").value.trim().toLowerCase();
+
+      filtered = rows.filter(r=>{
+        const evOk = (ev === "all") || (r.predicted_event === ev);
+        const revOk = (rev === "all") ||
+          (rev === "unreviewed" && r.review_decision === "unreviewed") ||
+          (rev === "confirmed"  && r.review_decision === "confirm_kw") ||
+          (rev === "denied"     && r.review_decision === "reject");
+        const qOk = !q || r.file.toLowerCase().includes(q);
+        return evOk && revOk && qOk;
+      });
+
+      renderCounts();
+      renderTable();
+      renderScatter();
+    }
+
+    // ======== Scatter (d3) ========
+    function renderScatter() {
+      const container = $("chartWrap");
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      d3.select("#chartWrap svg").remove();
+      const tooltip = $("tooltip");
+
+      svg = d3.select("#chartWrap").append("svg")
+          .attr("width", w).attr("height", h);
+
+      const plotW = w - margin.left - margin.right;
+      const plotH = h - margin.top - margin.bottom;
+      const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+      // x = rank by confidence (desc)
+      const sorted = filtered.slice().sort((a,b)=> b.confidence - a.confidence);
+      const indexMap = new Map(sorted.map((r, i) => [r.file, i]));
+      xScale = d3.scaleLinear().domain([0, Math.max(1, sorted.length - 1)]).range([0, plotW]);
+      yScale = d3.scaleLinear().domain([0, 1]).range([plotH, 0]).nice();
+
+      const thr = Number($("thr").value);
+      const lowNear = Number($("lowNear").value);
+      const midLow = Number($("midLow").value);
+      const highConf = Number($("highConf").value);
+
+      // === Band shading (drawn first, behind dots) ===
+      const bands = [
+          {y0: highConf, y1: 1, color: "#bbf7d0"},     // >0.70 green-ish
+          {y0: midLow,   y1: highConf, color: "#fde68a"}, // 0.30–0.70 yellow
+          {y0: thr,      y1: midLow,   color: "#fef3c7"}, // thr–0.30 light yellow
+          {y0: lowNear,  y1: thr,      color: "#e0e7ff"}, // lowNear–thr light indigo
+          {y0: 0,        y1: lowNear,  color: "#f3f4f6"}  // <lowNear gray
+      ];
+      g.selectAll(".band").data(bands).enter()
+          .append("rect")
+          .attr("class","band")
+          .attr("x",0).attr("width",plotW)
+          .attr("y", d=> yScale(d.y1))
+          .attr("height", d=> yScale(d.y0)-yScale(d.y1))
+          .attr("fill", d=> d.color)
+          .attr("opacity",0.4);
+
+      // axes
+      xAxis = d3.axisBottom(xScale).ticks(8);
+      yAxis = d3.axisLeft(yScale).ticks(6);
+      g.append("g").attr("transform", `translate(0,${plotH})`).call(xAxis);
+      g.append("g").call(yAxis);
+      g.append("text").attr("x", plotW/2).attr("y", plotH+30)
+          .attr("text-anchor","middle").attr("class","text-xs").text("File rank (by confidence)");
+      g.append("text").attr("transform","rotate(-90)").attr("x", -plotH/2).attr("y", -35)
+          .attr("text-anchor","middle").attr("class","text-xs").text("Confidence");
+
+      // dots
+      const color = (r) => {
+          if (r.review_decision === "confirm_kw") return "#059669";   // green
+          if (r.review_decision === "reject")    return "#dc2626";   // red
+          return (r.predicted_event === "species_of_interest") ? "#1d4ed8" : "#6b7280"; // blue/gray
+      };
+      g.selectAll(".dot").data(filtered, d=>d.file).enter()
+          .append("circle")
+          .attr("class","dot")
+          .attr("r", 4.5)
+          .attr("cx", d => xScale(indexMap.get(d.file) || 0))
+          .attr("cy", d => yScale(d.confidence))
+          .attr("fill", d => color(d))
+          .attr("stroke", "#111827")
+          .attr("stroke-width", d => (selected && selected.file === d.file) ? 2.5 : 1.0)
+          .on("mouseenter", (event, d) => {
+          tooltip.classList.remove("hidden");
+          tooltip.innerHTML = `
+              <div class="font-mono">${d.file}</div>
+              <div>pred: ${d.predicted_event}</div>
+              <div>conf: ${fmt4(d.confidence)}</div>
+              <div>review: ${d.review_decision}</div>
+          `;
+          const rect = container.getBoundingClientRect();
+          tooltip.style.left = (event.clientX - rect.left) + "px";
+          tooltip.style.top  = (event.clientY - rect.top  - 10) + "px";
+          })
+          .on("mouseleave", ()=> tooltip.classList.add("hidden"))
+          .on("click", (_, d) => selectRow(d));
+      }
+
+    // ======== Table ========
+    function renderTable() {
+      const tbody = $("tbody");
+      tbody.innerHTML = "";
+      for (const r of filtered) {
+        const tr = document.createElement("tr");
+        tr.className = "border-b";
+        tr.innerHTML = `
+          <td class="px-4 py-2 font-mono text-xs">${r.file}</td>
+          <td class="px-4 py-2">${r.predicted_event}</td>
+          <td class="px-4 py-2 tabular-nums">${fmt4(r.confidence)}</td>
+          <td class="px-4 py-2">${r.review_decision}</td>
+          <td class="px-4 py-2">${r.reviewer || ""}</td>
+          <td class="px-4 py-2">${r.reviewed_at || ""}</td>
+          <td class="px-4 py-2">${r.review_notes || ""}</td>
+        `;
+        tr.addEventListener("click", ()=> selectRow(r));
+        tbody.appendChild(tr);
+      }
+    }
+
+    function renderCounts() {
+      $("counts").textContent = `Rows: ${filtered.length} • Positives: ${filtered.filter(r=>r.predicted_event==='species_of_interest').length} • Reviewed: ${filtered.filter(r=>r.review_decision!=='unreviewed').length}`;
+    }
+
+    function renderAll() {
+      applyFilters();
+      selectRow(null); // clear panel
+    }
+
+    // ======== Review panel ========
+    function selectRow(r) {
+      selected = r;
+      const base = $("audioBase").value.trim().replace(/\/+$/, "");
+      if (!r) {
+        $("panel").classList.add("hidden");
+        $("noSel").classList.remove("hidden");
+        // also re-render to clear selected stroke width
+        renderScatter();
+        return;
+      }
+      $("noSel").classList.add("hidden");
+      $("panel").classList.remove("hidden");
+      $("pFile").textContent = r.file;
+      $("pPred").textContent = r.predicted_event;
+      $("pConf").textContent = fmt4(r.confidence);
+      $("pReviewer").value = (r.reviewer && r.reviewer.trim())
+        ? r.reviewer
+        : getDefaultReviewer();
+      $("pReviewer").oninput = (ev) => {
+        const name = ev.target.value.trim();
+        if (name) setDefaultReviewer(name);  // update persistent default as soon as they type
+      };
+      $("pNotes").value = r.review_notes || "";
+
+      // audio
+      const audioUrl = base ? `${base}/${encodeURIComponent(r.file)}` : "";
+      $("pAudio").src = audioUrl;
+
+      // re-render to highlight selected
+      renderScatter();
+    }
+
+    function saveReview(decision) {
+      if (!selected) return;
+      const typed = $("pReviewer").value.trim();
+      const def   = getDefaultReviewer();
+      const name  = typed || def || "";    // prefer typed; else default; else blank
+
+      if (typed && typed !== def) {
+        setDefaultReviewer(typed);         // keep default in sync if they typed a new name
+      }
+
+      selected.review_decision = decision;            // "confirm_kw" | "reject" | "unreviewed"
+      selected.reviewer        = name;
+      selected.review_notes    = $("pNotes").value.trim();
+      selected.reviewed_at     = nowIso();
+
+      $("saveMsg").classList.remove("hidden");
+      setTimeout(()=> $("saveMsg").classList.add("hidden"), 1200);
+      renderTable();
+      renderScatter();
+    }
+
+    // ======== Recompute (thresholds changed) ========
+    function recomputeAll() {
+      const thr = Number($("thr").value);
+      const lowNear = Number($("lowNear").value);
+      const midLow = Number($("midLow").value);
+      const highConf = Number($("highConf").value);
+      for (const r of rows) {
+        r.conf_band = bandOf(r.confidence, thr, lowNear, midLow, highConf);
+        r.priority  = priorityFor(r.predicted_event, r.confidence, thr, lowNear, midLow, highConf);
+      }
+      applyFilters();
+    }
+
+    // ======== Exports ========
+    function exportUpdatedCSV() {
+      // original columns + review fields
+      const cols = ["file","predicted_event","confidence","conf_band","priority","review_decision","reviewer","reviewed_at","review_notes"];
+      const csv = toCSV(rows, cols);
+      downloadBlob(csv, "predictions_reviewed.csv", "text/csv;charset=utf-8");
+    }
+    function exportReviewQueueCSV() {
+      // positives + top hard negatives (like before) using current thresholds:
+      const N_AUDIT_NEG = 40;
+      const positives = rows.filter(r => r.predicted_event === "species_of_interest");
+      const negatives = rows.filter(r => r.predicted_event !== "species_of_interest");
+      const hard = negatives.slice().sort((a,b)=> b.confidence - a.confidence).slice(0, N_AUDIT_NEG);
+      const dedup = [];
+      const key = new Set();
+      for (const r of [...positives, ...hard]) {
+        if (key.has(r.file)) continue; key.add(r.file); dedup.push(r);
+      }
+      const cols = ["file","predicted_event","confidence","conf_band","priority","review_decision"];
+      const csv = toCSV(dedup, cols);
+      downloadBlob(csv, "review_queue.csv", "text/csv;charset=utf-8");
+    }
+    function exportPositivesCSV() {
+      const pos = rows.filter(r => r.predicted_event === "species_of_interest");
+      const cols = ["file","predicted_event","confidence","conf_band","priority","review_decision"];
+      const csv = toCSV(pos, cols);
+      downloadBlob(csv, "positives_only.csv", "text/csv;charset=utf-8");
+    }
+
+    // ======== Wire up ========
+    $("dropzone").addEventListener("click", ()=> $("csvInput").click());
+    $("csvInput").addEventListener("change", (e)=> {
+      if (!e.target.files?.length) return;
+      parseCSVFile(e.target.files[0]).then(ingestData).catch(err=> alert("Parse error: "+err.message));
+    });
+    $("dropzone").addEventListener("dragover", (e)=> { e.preventDefault(); });
+    $("dropzone").addEventListener("drop", (e)=> {
+      e.preventDefault();
+      if (!e.dataTransfer.files?.length) return;
+      parseCSVFile(e.dataTransfer.files[0]).then(ingestData).catch(err=> alert("Parse error: "+err.message));
+    });
+
+    ["thr","lowNear","midLow","highConf"].forEach(id=> $(id).addEventListener("change", recomputeAll));
+    ["filterEvent","filterReviewed","search"].forEach(id=> $(id).addEventListener("input", applyFilters));
+
+    $("recompute").addEventListener("click", recomputeAll);
+    $("exportUpdated").addEventListener("click", exportUpdatedCSV);
+    $("exportReview").addEventListener("click", exportReviewQueueCSV);
+    $("exportPos").addEventListener("click", exportPositivesCSV);
+
+    $("btnConfirm").addEventListener("click", ()=> saveReview("confirm_kw"));
+    $("btnReject").addEventListener("click", ()=> saveReview("reject"));
+    $("btnReset").addEventListener("click", ()=> saveReview("unreviewed"));
+
+    // === Keyboard navigation & review actions (respects focused inputs) ===
+    document.addEventListener("keydown", (e) => {
+      if (!filtered.length) return;
+
+      // If user is typing in an editable element, ignore our shortcuts.
+      const t = e.target;
+      const tag = (t.tagName || "").toLowerCase();
+      const isEditable =
+        t.isContentEditable ||
+        tag === "input" ||
+        tag === "textarea" ||
+        tag === "select";
+
+      // OPTIONAL: require a modifier for shortcuts
+      const REQUIRE_MOD = false;
+      const hasRequiredMod = e.altKey || e.metaKey || e.ctrlKey;
+
+      // Navigation
+      if (!isEditable && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
+        e.preventDefault();
+        let idx = selected ? filtered.findIndex(r => r.file === selected.file) : -1;
+        idx = e.key === "ArrowRight"
+          ? (idx + 1) % filtered.length
+          : (idx - 1 + filtered.length) % filtered.length;
+        selectRow(filtered[idx]);
+        return;
+      }
+
+      // Space toggles audio
+      if (selected && !isEditable && e.code === "Space") {
+        e.preventDefault();
+        const audio = $("pAudio");
+        if (!audio.src) return;
+        if (audio.paused) audio.play();
+        else audio.pause();
+        return;
+      }
+
+      // Review actions (C/D/R)
+      if (selected) {
+        const k = e.key.toLowerCase();
+        if (!isEditable && (!REQUIRE_MOD || hasRequiredMod)) {
+          if (k === "c") { e.preventDefault(); saveReview("confirm_kw"); }
+          if (k === "d") { e.preventDefault(); saveReview("reject"); }
+          if (k === "r") { e.preventDefault(); saveReview("unreviewed"); }
+        }
+      }
+    });
+
+    // Initialize global reviewer field on load (visible before CSV)
+    const gRev = $("globalReviewer");
+    if (gRev) {
+      gRev.value = getDefaultReviewer();
+      gRev.oninput = (e) => {
+        const name = e.target.value.trim();
+        setDefaultReviewer(name);
+      };
+    }
+
+    // Pre-fill reviewer field in panel (if present) with persistent default on load
+    const reviewerInput = $("pReviewer");
+    if (reviewerInput) {
+      reviewerInput.value = getDefaultReviewer();
+      reviewerInput.oninput = (ev) => {
+        const name = ev.target.value.trim();
+        if (name) setDefaultReviewer(name);
+      };
+    }
+  </script>
+</body>
+</html>
