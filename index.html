@@ -82,8 +82,8 @@
           <label class="block text-sm font-medium">Filter: Predicted Event</label>
           <select id="filterEvent" class="w-full rounded-lg border-gray-300 focus:ring-0 focus:border-gray-800">
             <option value="all">All</option>
-            <option value="species_of_interest">species_of_interest</option>
-            <option value="not_species_of_interest">not_species_of_interest</option>
+            <option value="SOI">SOI</option>
+            <option value="not_SOI">not_SOI</option>
           </select>
         </div>
         <div>
@@ -122,18 +122,16 @@
         </p>
       </div>
     </section>
-
-    <!-- Graph + Sidebar -->
+ <!-- Graphs + Sidebar -->
     <section class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <!-- Scatter -->
+      <!-- Confidence Scatter -->
       <div class="lg:col-span-2 bg-white rounded-2xl shadow p-4 relative">
         <div class="flex items-center justify-between mb-2">
           <h2 class="font-semibold">Confidence Scatter</h2>
-          <div class="text-xs text-gray-500">CLICK A DOT to review or press the RIGHT ARROW to start at first clip</div>
+          <div class="text-xs text-gray-500">Click a dot to review • RIGHT/LEFT = navigate • SPACE = play/pause</div>
         </div>
         <div id="chartWrap" class="w-full h-[520px] relative">
           <div id="tooltip" class="tooltip hidden"></div>
-          <!-- SVG is injected here -->
         </div>
         <div class="mt-2 text-xs text-gray-500">
           X: file rank (sorted by confidence desc) • Y: confidence (0–1) • Color: event / review status
@@ -152,7 +150,7 @@
           <div class="grid grid-cols-2 gap-3 text-sm">
             <div>
               <div class="text-xs text-gray-500">Predicted</div>
-              <div id="pPred" class=""></div>
+              <div id="pPred"></div>
             </div>
             <div>
               <div class="text-xs text-gray-500">Confidence</div>
@@ -185,6 +183,24 @@
       </aside>
     </section>
 
+    <!-- Cluster Panel -->
+    <section class="bg-white rounded-2xl shadow p-4 mt-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="font-semibold">Cluster Map (emb_x vs emb_y)</h2>
+        <div class="text-xs text-gray-500" id="clusterHint">Loads automatically if <code>cluster, emb_x, emb_y</code> columns exist.</div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <div id="clusterChartWrap" class="lg:col-span-3 w-full h-[520px] relative">
+          <div id="clusterTooltip" class="tooltip hidden"></div>
+        </div>
+        <div>
+          <div class="text-sm font-medium mb-2">Legend</div>
+          <div id="clusterLegend" class="text-sm space-y-1"></div>
+          <div class="text-xs text-gray-500 mt-3">Click a cluster point to review that file.</div>
+        </div>
+      </div>
+    </section>
+
     <!-- Table -->
     <section class="bg-white rounded-2xl shadow overflow-hidden mt-4">
       <div class="overflow-x-auto">
@@ -194,6 +210,7 @@
               <th class="px-4 py-3 text-left">File</th>
               <th class="px-4 py-3 text-left">Predicted</th>
               <th class="px-4 py-3 text-left">Confidence</th>
+              <th class="px-4 py-3 text-left">Cluster</th>
               <th class="px-4 py-3 text-left">Review Decision</th>
               <th class="px-4 py-3 text-left">Reviewer</th>
               <th class="px-4 py-3 text-left">Reviewed At</th>
@@ -208,18 +225,23 @@
 
   <script>
     // ======== State ========
-    let rows = [];           // all items {file, predicted_event, confidence, ...review fields}
+    let rows = [];           // all items (predictions) + review fields, may include cluster & emb coords
     let filtered = [];       // after filters/search
-    let selected = null;     // current row (object ref)
-    let svg, xScale, yScale, colorScale, xAxis, yAxis;
+    let selected = null;     // current row
+    let svg, xScale, yScale, xAxis, yAxis;
+    let csvHasClusters = false;
+
+    // Cluster chart handles
+    let svgC, xC, yC;
+
     const margin = {top: 10, right: 20, bottom: 40, left: 45};
 
     // ======== Helpers ========
     const $ = (id) => document.getElementById(id);
-    const fmt4 = (x) => (typeof x === "number" ? x.toFixed(4) : x);
+    const fmt4 = (x) => (x==null || isNaN(x) ? "" : Number(x).toFixed(4));
     const nowIso = () => new Date().toISOString();
 
-    // Threshold bands (same logic as Python)
+    // Threshold bands (for confidence shading)
     function bandOf(conf, thr, lowNear, midLow, highConf) {
       if (conf >= highConf) return ">0.70";
       if (conf >= midLow)  return "0.30–0.70";
@@ -228,16 +250,12 @@
       return `<${lowNear.toFixed(2)}`;
     }
 
-    // --- Persistent reviewer name (localStorage) ---
+    // Persistent reviewer (localStorage)
     const REVIEWER_KEY = "warbler.defaultReviewer";
-    function getDefaultReviewer() {
-      try { return localStorage.getItem(REVIEWER_KEY) || ""; } catch { return ""; }
-    }
-    function setDefaultReviewer(name) {
-      try { localStorage.setItem(REVIEWER_KEY, name || ""); } catch {}
-    }
+    const getDefaultReviewer = () => { try { return localStorage.getItem(REVIEWER_KEY) || ""; } catch { return ""; } };
+    const setDefaultReviewer = (name) => { try { localStorage.setItem(REVIEWER_KEY, name || ""); } catch {} };
 
-    // Build review priority/action (we keep decision separate)
+    // Priority (same as before; optional)
     function priorityFor(pred, conf, thr, lowNear, midLow, highConf) {
       if (pred === "species_of_interest") {
         if (conf >= highConf) return "P1 (High)";
@@ -272,43 +290,47 @@
 
     function toCSV(arr, columns) {
       const header = columns.join(",");
-      theLines = arr.map(r => columns.map(c => {
+      const lines = arr.map(r => columns.map(c => {
         const v = r[c];
         const s = (v === undefined || v === null) ? "" : String(v);
         return `"${s.replace(/"/g,'""')}"`;
       }).join(","));
-      return [header, ...theLines].join("\n");
+      return [header, ...lines].join("\n");
     }
 
-    // ======== Ingest & annotate ========
+    // ======== Ingest ========
     function ingestData(data) {
       const thr = Number($("thr").value);
       const lowNear = Number($("lowNear").value);
       const midLow = Number($("midLow").value);
       const highConf = Number($("highConf").value);
 
-      // Normalize required fields; add review defaults
+      // detect cluster columns
+      csvHasClusters = data.length && ("cluster" in data[0]) && ("emb_x" in data[0]) && ("emb_y" in data[0]);
+
       rows = data.map(r => ({
         file: String(r.file ?? "").trim(),
         predicted_event: String(r.predicted_event ?? "").trim(),
-        confidence: Number.isFinite(Number(r.confidence)) ? Number(r.confidence) : 0,
-        // Computed annotations
+        confidence: Number(r.confidence ?? "0"),
+        // clustering (may be absent)
+        cluster: (r.cluster !== undefined && r.cluster !== "") ? Number(r.cluster) : null,
+        emb_x: (r.emb_x !== undefined && r.emb_x !== "") ? Number(r.emb_x) : null,
+        emb_y: (r.emb_y !== undefined && r.emb_y !== "") ? Number(r.emb_y) : null,
+        // derived
         conf_band: "",
         priority: "",
-        // Review fields
+        // review fields (carry over if present)
         review_decision: (r.review_decision ?? "unreviewed"),
         reviewer: (r.reviewer ?? ""),
         reviewed_at: (r.reviewed_at ?? ""),
         review_notes: (r.review_notes ?? ""),
       })).filter(r => r.file && !Number.isNaN(r.confidence));
 
-      // compute bands/priorities
       for (const r of rows) {
-        r.conf_band = bandOf(r.confidence, thr, lowNear, midLow, highConf);
-        r.priority  = priorityFor(r.predicted_event, r.confidence, thr, lowNear, midLow, highConf);
+        r.conf_band = bandOf(r.confidence, thr, Math.min(0.10, thr), midLow, highConf);
+        r.priority  = priorityFor(r.predicted_event, r.confidence, thr, Math.min(0.10, thr), midLow, highConf);
       }
 
-      // default sorting = by confidence desc
       rows.sort((a,b)=> b.confidence - a.confidence);
       filtered = rows.slice();
       renderAll();
@@ -325,7 +347,7 @@
         const revOk = (rev === "all") ||
           (rev === "unreviewed" && r.review_decision === "unreviewed") ||
           (rev === "confirmed"  && r.review_decision === "confirm_kw") ||
-          (rev === "denied"     && r.review_decision === "reject");
+          (rev === "denied"     && (r.review_decision === "deny_kw" || r.review_decision === "reject"));
         const qOk = !q || r.file.toLowerCase().includes(q);
         return evOk && revOk && qOk;
       });
@@ -333,9 +355,10 @@
       renderCounts();
       renderTable();
       renderScatter();
+      renderClusterScatter(); // keep in sync
     }
 
-    // ======== Scatter (d3) ========
+    // ======== Confidence Scatter ========
     function renderScatter() {
       const container = $("chartWrap");
       const w = container.clientWidth;
@@ -361,22 +384,20 @@
       const midLow = Number($("midLow").value);
       const highConf = Number($("highConf").value);
 
-      // === Band shading (drawn first, behind dots) ===
+      // Band shading
       const bands = [
-          {y0: highConf, y1: 1, color: "#bbf7d0"},     // >0.70 green-ish
-          {y0: midLow,   y1: highConf, color: "#fde68a"}, // 0.30–0.70 yellow
-          {y0: thr,      y1: midLow,   color: "#fef3c7"}, // thr–0.30 light yellow
-          {y0: lowNear,  y1: thr,      color: "#e0e7ff"}, // lowNear–thr light indigo
-          {y0: 0,        y1: lowNear,  color: "#f3f4f6"}  // <lowNear gray
+          {y0: highConf, y1: 1, color: "#bbf7d0"},
+          {y0: midLow,   y1: highConf, color: "#fde68a"},
+          {y0: thr,      y1: midLow,   color: "#fef3c7"},
+          {y0: lowNear,  y1: thr,      color: "#e0e7ff"},
+          {y0: 0,        y1: lowNear,  color: "#f3f4f6"}
       ];
       g.selectAll(".band").data(bands).enter()
-          .append("rect")
-          .attr("class","band")
-          .attr("x",0).attr("width",plotW)
-          .attr("y", d=> yScale(d.y1))
-          .attr("height", d=> yScale(d.y0)-yScale(d.y1))
-          .attr("fill", d=> d.color)
-          .attr("opacity",0.4);
+        .append("rect")
+        .attr("x",0).attr("width",plotW)
+        .attr("y", d=> yScale(d.y1))
+        .attr("height", d=> yScale(d.y0)-yScale(d.y1))
+        .attr("fill", d=> d.color).attr("opacity",0.4);
 
       // axes
       xAxis = d3.axisBottom(xScale).ticks(8);
@@ -384,40 +405,121 @@
       g.append("g").attr("transform", `translate(0,${plotH})`).call(xAxis);
       g.append("g").call(yAxis);
       g.append("text").attr("x", plotW/2).attr("y", plotH+30)
-          .attr("text-anchor","middle").attr("class","text-xs").text("File rank (by confidence)");
+        .attr("text-anchor","middle").attr("class","text-xs").text("File rank (by confidence)");
       g.append("text").attr("transform","rotate(-90)").attr("x", -plotH/2).attr("y", -35)
-          .attr("text-anchor","middle").attr("class","text-xs").text("Confidence");
+        .attr("text-anchor","middle").attr("class","text-xs").text("Confidence");
 
-      // dots
+      // dot color
       const color = (r) => {
-          if (r.review_decision === "confirm_kw") return "#059669";   // green
-          if (r.review_decision === "reject")    return "#dc2626";   // red
-          return (r.predicted_event === "species_of_interest") ? "#1d4ed8" : "#6b7280"; // blue/gray
+        if (r.review_decision === "confirm_kw") return "#059669";
+        if (r.review_decision === "deny_kw" || r.review_decision === "reject") return "#dc2626";
+        return (r.predicted_event === "species_of_interest") ? "#1d4ed8" : "#6b7280";
       };
+
       g.selectAll(".dot").data(filtered, d=>d.file).enter()
-          .append("circle")
-          .attr("class","dot")
-          .attr("r", 4.5)
-          .attr("cx", d => xScale(indexMap.get(d.file) || 0))
-          .attr("cy", d => yScale(d.confidence))
-          .attr("fill", d => color(d))
-          .attr("stroke", "#111827")
-          .attr("stroke-width", d => (selected && selected.file === d.file) ? 2.5 : 1.0)
-          .on("mouseenter", (event, d) => {
+        .append("circle")
+        .attr("class","dot")
+        .attr("r", 4.5)
+        .attr("cx", d => xScale(indexMap.get(d.file) || 0))
+        .attr("cy", d => yScale(d.confidence))
+        .attr("fill", d => color(d))
+        .attr("stroke", "#111827")
+        .attr("stroke-width", d => (selected && selected.file === d.file) ? 2.5 : 1.0)
+        .on("mouseenter", (event, d) => {
           tooltip.classList.remove("hidden");
           tooltip.innerHTML = `
-              <div class="font-mono">${d.file}</div>
-              <div>pred: ${d.predicted_event}</div>
-              <div>conf: ${fmt4(d.confidence)}</div>
-              <div>review: ${d.review_decision}</div>
+            <div class="font-mono">${d.file}</div>
+            <div>pred: ${d.predicted_event}</div>
+            <div>conf: ${fmt4(d.confidence)}</div>
+            <div>review: ${d.review_decision}</div>
           `;
           const rect = container.getBoundingClientRect();
           tooltip.style.left = (event.clientX - rect.left) + "px";
           tooltip.style.top  = (event.clientY - rect.top  - 10) + "px";
-          })
-          .on("mouseleave", ()=> tooltip.classList.add("hidden"))
-          .on("click", (_, d) => selectRow(d));
+        })
+        .on("mouseleave", ()=> tooltip.classList.add("hidden"))
+        .on("click", (_, d) => selectRow(d));
+    }
+
+    // ======== Cluster Scatter (emb_x / emb_y) ========
+    function renderClusterScatter() {
+      const container = $("clusterChartWrap");
+      const hint = $("clusterHint");
+      const legend = $("clusterLegend");
+      const tooltip = $("clusterTooltip");
+
+      d3.select("#clusterChartWrap svg").remove();
+      legend.innerHTML = "";
+
+      // need cluster columns
+      const pts = filtered.filter(r => r.emb_x != null && r.emb_y != null && r.cluster != null);
+      if (!pts.length) {
+        hint.textContent = "No cluster data available in this CSV (or filtered out).";
+        return;
+      } else {
+        hint.textContent = "Colored by cluster; stroke shows review state.";
       }
+
+      const w = container.clientWidth, h = container.clientHeight;
+      svgC = d3.select("#clusterChartWrap").append("svg").attr("width", w).attr("height", h);
+
+      const m = {top: 10, right: 10, bottom: 35, left: 40};
+      const pw = w - m.left - m.right;
+      const ph = h - m.top - m.bottom;
+      const g = svgC.append("g").attr("transform", `translate(${m.left},${m.top})`);
+
+      const xs = pts.map(d=> +d.emb_x), ys = pts.map(d=> +d.emb_y);
+      xC = d3.scaleLinear().domain(d3.extent(xs)).nice().range([0, pw]);
+      yC = d3.scaleLinear().domain(d3.extent(ys)).nice().range([ph, 0]);
+
+      g.append("g").attr("transform", `translate(0,${ph})`).call(d3.axisBottom(xC).ticks(6));
+      g.append("g").call(d3.axisLeft(yC).ticks(6));
+      g.append("text").attr("x", pw/2).attr("y", ph+28).attr("text-anchor","middle").attr("class","text-xs")
+        .text("emb_x");
+      g.append("text").attr("transform","rotate(-90)").attr("x", -ph/2).attr("y", -30)
+        .attr("text-anchor","middle").attr("class","text-xs").text("emb_y");
+
+      const clusters = Array.from(new Set(pts.map(d=> d.cluster))).sort((a,b)=> a-b);
+      const colorC = d3.scaleOrdinal().domain(clusters).range(d3.schemeTableau10);
+
+      // Legend
+      clusters.forEach(c => {
+        const row = document.createElement("div");
+        row.className = "flex items-center gap-2";
+        row.innerHTML = `<span class="inline-block w-3 h-3 rounded" style="background:${colorC(c)}"></span> Cluster ${c}`;
+        legend.appendChild(row);
+      });
+
+      // stroke by review state
+      const strokeFor = (r) => {
+        if (r.review_decision === "confirm_kw") return "#059669";
+        if (r.review_decision === "deny_kw" || r.review_decision === "reject") return "#dc2626";
+        return "#111827";
+      };
+
+      g.selectAll(".cdot").data(pts, d=>d.file).enter()
+        .append("circle")
+        .attr("class","cdot")
+        .attr("r", 4.5)
+        .attr("cx", d => xC(+d.emb_x))
+        .attr("cy", d => yC(+d.emb_y))
+        .attr("fill", d => colorC(d.cluster))
+        .attr("stroke", d => (selected && selected.file === d.file) ? "#000" : strokeFor(d))
+        .attr("stroke-width", d => (selected && selected.file === d.file) ? 2.5 : 1.0)
+        .on("mouseenter", (event, d) => {
+          tooltip.classList.remove("hidden");
+          tooltip.innerHTML = `
+            <div class="font-mono">${d.file}</div>
+            <div>cluster: ${d.cluster}</div>
+            <div>conf: ${fmt4(d.confidence)}</div>
+          `;
+          const rect = container.getBoundingClientRect();
+          tooltip.style.left = (event.clientX - rect.left) + "px";
+          tooltip.style.top  = (event.clientY - rect.top  - 10) + "px";
+        })
+        .on("mouseleave", ()=> tooltip.classList.add("hidden"))
+        .on("click", (_, d) => selectRow(d));
+    }
 
     // ======== Table ========
     function renderTable() {
@@ -430,6 +532,7 @@
           <td class="px-4 py-2 font-mono text-xs">${r.file}</td>
           <td class="px-4 py-2">${r.predicted_event}</td>
           <td class="px-4 py-2 tabular-nums">${fmt4(r.confidence)}</td>
+          <td class="px-4 py-2">${r.cluster ?? ""}</td>
           <td class="px-4 py-2">${r.review_decision}</td>
           <td class="px-4 py-2">${r.reviewer || ""}</td>
           <td class="px-4 py-2">${r.reviewed_at || ""}</td>
@@ -446,7 +549,8 @@
 
     function renderAll() {
       applyFilters();
-      selectRow(null); // clear panel
+      selectRow(null); // clear panel highlight
+      // cluster chart rendered inside applyFilters
     }
 
     // ======== Review panel ========
@@ -456,8 +560,8 @@
       if (!r) {
         $("panel").classList.add("hidden");
         $("noSel").classList.remove("hidden");
-        // also re-render to clear selected stroke width
         renderScatter();
+        renderClusterScatter();
         return;
       }
       $("noSel").classList.add("hidden");
@@ -465,34 +569,28 @@
       $("pFile").textContent = r.file;
       $("pPred").textContent = r.predicted_event;
       $("pConf").textContent = fmt4(r.confidence);
-      $("pReviewer").value = (r.reviewer && r.reviewer.trim())
-        ? r.reviewer
-        : getDefaultReviewer();
+      $("pReviewer").value = (r.reviewer && r.reviewer.trim()) ? r.reviewer : getDefaultReviewer();
       $("pReviewer").oninput = (ev) => {
         const name = ev.target.value.trim();
-        if (name) setDefaultReviewer(name);  // update persistent default as soon as they type
+        if (name) setDefaultReviewer(name);
       };
       $("pNotes").value = r.review_notes || "";
 
-      // audio
-      const audioUrl = base ? `${base}/${encodeURIComponent(r.file)}` : "";
-      $("pAudio").src = audioUrl;
+      $("pAudio").src = base ? `${base}/${encodeURIComponent(r.file)}` : "";
 
-      // re-render to highlight selected
       renderScatter();
+      renderClusterScatter();
     }
 
     function saveReview(decision) {
       if (!selected) return;
       const typed = $("pReviewer").value.trim();
       const def   = getDefaultReviewer();
-      const name  = typed || def || "";    // prefer typed; else default; else blank
+      const name  = typed || def || "";
 
-      if (typed && typed !== def) {
-        setDefaultReviewer(typed);         // keep default in sync if they typed a new name
-      }
+      if (typed && typed !== def) setDefaultReviewer(typed);
 
-      selected.review_decision = decision;            // "confirm_kw" | "reject" | "unreviewed"
+      selected.review_decision = decision;  // "confirm_kw" | "reject" | "unreviewed"
       selected.reviewer        = name;
       selected.review_notes    = $("pNotes").value.trim();
       selected.reviewed_at     = nowIso();
@@ -501,6 +599,7 @@
       setTimeout(()=> $("saveMsg").classList.add("hidden"), 1200);
       renderTable();
       renderScatter();
+      renderClusterScatter();
     }
 
     // ======== Recompute (thresholds changed) ========
@@ -510,21 +609,19 @@
       const midLow = Number($("midLow").value);
       const highConf = Number($("highConf").value);
       for (const r of rows) {
-        r.conf_band = bandOf(r.confidence, thr, lowNear, midLow, highConf);
-        r.priority  = priorityFor(r.predicted_event, r.confidence, thr, lowNear, midLow, highConf);
+        r.conf_band = bandOf(r.confidence, thr, Math.min(0.10, thr), midLow, highConf);
+        r.priority  = priorityFor(r.predicted_event, r.confidence, thr, Math.min(0.10, thr), midLow, highConf);
       }
       applyFilters();
     }
 
     // ======== Exports ========
     function exportUpdatedCSV() {
-      // original columns + review fields
-      const cols = ["file","predicted_event","confidence","conf_band","priority","review_decision","reviewer","reviewed_at","review_notes"];
+      const cols = ["file","predicted_event","confidence","cluster","emb_x","emb_y","conf_band","priority","review_decision","reviewer","reviewed_at","review_notes"];
       const csv = toCSV(rows, cols);
       downloadBlob(csv, "predictions_reviewed.csv", "text/csv;charset=utf-8");
     }
     function exportReviewQueueCSV() {
-      // positives + top hard negatives (like before) using current thresholds:
       const N_AUDIT_NEG = 40;
       const positives = rows.filter(r => r.predicted_event === "species_of_interest");
       const negatives = rows.filter(r => r.predicted_event !== "species_of_interest");
@@ -534,13 +631,13 @@
       for (const r of [...positives, ...hard]) {
         if (key.has(r.file)) continue; key.add(r.file); dedup.push(r);
       }
-      const cols = ["file","predicted_event","confidence","conf_band","priority","review_decision"];
+      const cols = ["file","predicted_event","confidence","cluster","conf_band","priority","review_decision"];
       const csv = toCSV(dedup, cols);
       downloadBlob(csv, "review_queue.csv", "text/csv;charset=utf-8");
     }
     function exportPositivesCSV() {
       const pos = rows.filter(r => r.predicted_event === "species_of_interest");
-      const cols = ["file","predicted_event","confidence","conf_band","priority","review_decision"];
+      const cols = ["file","predicted_event","confidence","cluster","conf_band","priority","review_decision"];
       const csv = toCSV(pos, cols);
       downloadBlob(csv, "positives_only.csv", "text/csv;charset=utf-8");
     }
@@ -570,24 +667,14 @@
     $("btnReject").addEventListener("click", ()=> saveReview("reject"));
     $("btnReset").addEventListener("click", ()=> saveReview("unreviewed"));
 
-    // === Keyboard navigation & review actions (respects focused inputs) ===
+    // Keyboard navigation & actions
     document.addEventListener("keydown", (e) => {
       if (!filtered.length) return;
 
-      // If user is typing in an editable element, ignore our shortcuts.
       const t = e.target;
       const tag = (t.tagName || "").toLowerCase();
-      const isEditable =
-        t.isContentEditable ||
-        tag === "input" ||
-        tag === "textarea" ||
-        tag === "select";
+      const isEditable = t.isContentEditable || tag === "input" || tag === "textarea" || tag === "select";
 
-      // OPTIONAL: require a modifier for shortcuts
-      const REQUIRE_MOD = false;
-      const hasRequiredMod = e.altKey || e.metaKey || e.ctrlKey;
-
-      // Navigation
       if (!isEditable && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
         e.preventDefault();
         let idx = selected ? filtered.findIndex(r => r.file === selected.file) : -1;
@@ -598,38 +685,28 @@
         return;
       }
 
-      // Space toggles audio
       if (selected && !isEditable && e.code === "Space") {
         e.preventDefault();
         const audio = $("pAudio");
         if (!audio.src) return;
-        if (audio.paused) audio.play();
-        else audio.pause();
+        if (audio.paused) audio.play(); else audio.pause();
         return;
       }
 
-      // Review actions (C/D/R)
-      if (selected) {
+      if (selected && !isEditable) {
         const k = e.key.toLowerCase();
-        if (!isEditable && (!REQUIRE_MOD || hasRequiredMod)) {
-          if (k === "c") { e.preventDefault(); saveReview("confirm_kw"); }
-          if (k === "d") { e.preventDefault(); saveReview("reject"); }
-          if (k === "r") { e.preventDefault(); saveReview("unreviewed"); }
-        }
+        if (k === "c") { e.preventDefault(); saveReview("confirm_kw"); }
+        if (k === "d") { e.preventDefault(); saveReview("reject"); }
+        if (k === "r") { e.preventDefault(); saveReview("unreviewed"); }
       }
     });
 
-    // Initialize global reviewer field on load (visible before CSV)
+    // Initialize global reviewer
     const gRev = $("globalReviewer");
     if (gRev) {
       gRev.value = getDefaultReviewer();
-      gRev.oninput = (e) => {
-        const name = e.target.value.trim();
-        setDefaultReviewer(name);
-      };
+      gRev.oninput = (e) => setDefaultReviewer(e.target.value.trim());
     }
-
-    // Pre-fill reviewer field in panel (if present) with persistent default on load
     const reviewerInput = $("pReviewer");
     if (reviewerInput) {
       reviewerInput.value = getDefaultReviewer();
