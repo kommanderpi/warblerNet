@@ -230,7 +230,6 @@
     let selected = null;     // current row
     let svg, xScale, yScale, xAxis, yAxis;
     let csvHasClusters = false;
-    let audioBase = "audio/";  // default base folder for audio
 
     // Cluster chart handles
     let svgC, xC, yC;
@@ -241,19 +240,7 @@
     const $ = (id) => document.getElementById(id);
     const fmt4 = (x) => (x==null || isNaN(x) ? "" : Number(x).toFixed(4));
     const nowIso = () => new Date().toISOString();
-
-    // Allow user override via input box if needed
-    function setAudioBase(newBase) {
-      audioBase = newBase.endsWith("/") ? newBase : newBase + "/";
-      console.log("Audio base set to:", audioBase);
-    }
-
-    // Example: building an <audio> player for a given file
-    function playAudio(file) {
-      const audioPath = audioBase + file;
-      const audio = new Audio(audioPath);
-      audio.play().catch(err => console.error("Could not play:", audioPath, err));
-    }
+    
     // Threshold bands (for confidence shading)
     function bandOf(conf, thr, lowNear, midLow, highConf) {
       if (conf >= highConf) return ">0.70";
